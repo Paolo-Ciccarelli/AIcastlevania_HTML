@@ -19,8 +19,10 @@
        X ............. fire (hold)      C ................ whip
        Down / S ...... crouch (hold)    R ................ reload
        Down + L/R .... crouch-walk      U ................ ultimate (full mag)
+       Down, Down .... drop through to the platform below (double-tap)
        Enter ......... start / restart  F ................ FPS readout
-     On touch devices an on-screen pad appears (RLD = reload, ▼ = crouch).
+     On touch devices an on-screen pad appears (RLD = reload, ▼ = crouch;
+     double-tapping ▼ drops through, exactly as on the keyboard).
 
      ARCHITECTURE OVERVIEW
      ---------------------
@@ -154,6 +156,29 @@
 
      CHANGELOG
      ---------
+     Build 14 — drop-through
+     * Double-tap crouch to phase through the platform you are standing
+       on and fall to the one below. Every surface here is one-way, so
+       until now the only way DOWN was to walk off an end, and the lower
+       routes could only be entered where the art happened to leave a
+       gap. Now every overlap has a door.
+     * The tap is REFUSED when nothing is below to catch him, so on open
+       embankment a double-tap is just two ducks. Without that check a
+       mistimed input on the section 1 embankment would drop him into
+       the trench and kill him.
+     * groundEntity() takes an optional floor to ignore; the player
+       passes it while dropping. Enemies are unaffected.
+     * Because dropping down is now possible, the section 2 fork is the
+       right way round: `road` runs unbroken from the terrace up the
+       ramp and out, so walking right follows the painted main road and
+       the underpass is the deliberate choice. It carries one wolf
+       instead of three — a bypass that trades three enemies for the
+       high ground, not a free corridor.
+     * The underpass now starts at 1465 rather than 1418. Level with the
+       terrace it was stealing walking players off the road: where two
+       lines meet at the same height, slope-following picks whichever is
+       a hair nearer the feet. 17px of separation settles it.
+
      Build 13 — the far bank, and the paths that were missing
      * Third section: worldW 2116 -> 3259. LV1_Platform03 stitched on at
        scale 0.647, its x=0 at world 2045, shifted DOWN 33px.
@@ -564,9 +589,34 @@ const WALK_STRIDE_PX = 22;
 const STAND_H = 66, CROUCH_H = 44;
 const CROUCH_ACCEL = .4, CROUCH_STRIDE_PX = 15;
 
+/* ---- DROP-THROUGH -------------------------------------------------------
+ * Double-tap crouch to phase through the platform you are standing on and
+ * fall to the one below.
+ *
+ * Every surface in this game is one-way: you rise through it and land on
+ * top of it, and nothing can pass downward. That is what lets the trench
+ * run under the embankment and the underpass run under the ramp, but it
+ * also meant the only way DOWN was to walk off an end, so the lower routes
+ * could only be entered where the art happened to provide a gap. This
+ * gives every overlap a door.
+ *
+ * DROP_TAP_WINDOW is how close the two taps must be. 18 ticks (0.3s) is
+ * comfortably longer than a deliberate double-tap and comfortably shorter
+ * than the rhythm of tapping crouch twice for two separate ducks.
+ *
+ * DROP_TICKS is only a safety cap on how long the surface stays ignored:
+ * the state normally clears the moment he lands on something lower.
+ *
+ * The tap is REFUSED if there is nothing below to catch him — see
+ * dropThrough(). Without that check, double-tapping on open embankment
+ * would drop him into the trench and kill him, which is a lot of damage
+ * for a mistimed input. */
+const DROP_TAP_WINDOW = 18, DROP_TICKS = 30;
+
 const p = { x:40, y:290, w:36, h:STAND_H, vx:0, vy:0, face:1,
             hp:8, maxhp:8, onGround:false, crouch:false,
             cool:0, whip:0, whipId:0, ult:0, inv:0, anim:0, stride:0,
+            dropThru:0, dropFrom:0, lastDownTap:-999,
             ammo:8, magSize:8, reload:0 };
 
 /**
@@ -577,6 +627,27 @@ const p = { x:40, y:290, w:36, h:STAND_H, vx:0, vy:0, face:1,
  * tick's ground check would drop him. Recomputing y from the feet keeps
  * him planted on the slope he is standing on.
  */
+/**
+ * Start a drop-through, or refuse it.
+ *
+ * Returns false — and does nothing at all — unless there is a surface
+ * strictly below his feet at this x. That refusal is the whole safety of
+ * the mechanic: on open ground a double-tap is simply two ducks, and only
+ * where a lower route genuinely exists does it become a door.
+ */
+function dropThrough(){
+  if (!p.onGround || p.ult > 0 || state !== "play") return false;
+  const feet = p.y + p.h;
+  const below = surfacesAt(p.x + p.w/2).some(y => y > feet + 2);
+  if (!below) return false;
+  setCrouch(false);              // he is about to be airborne
+  p.dropFrom = feet;             // ignore everything at or above this
+  p.dropThru = DROP_TICKS;
+  p.onGround = false;
+  p.vy = Math.max(p.vy, 1.5);    // commit downward so he clears the lip
+  return true;
+}
+
 function setCrouch(on){
   if (on === p.crouch) return;
   const feet = p.y + p.h;
@@ -615,24 +686,22 @@ function setCrouch(on){
  *               to x472, and step back up onto `upper` (the two are 12px
  *               apart there, inside STEP).
  *   grass     – the strip beyond the pillar, 1075 -> 1215.
- *   road      – section 2's terrace, 1215 -> 1425. Shares its first vertex
- *               with `grass` so the join needs no special case.
- *   underpass – section 2's lower route, 1418 -> 1866, and the one a
- *               player walks by default: `road` ends level with it, so you
- *               step straight on. It sinks to 447 under the ramp and
- *               climbs back to meet `ramp` at 1866.
- *   ramp      – everything above and beyond: the ramp out of the terrace,
- *               the high road, the bridge, and the whole of section 3 out
- *               to the level bound.
+ *   road      – the main route from section 2's terrace all the way out:
+ *               terrace, ramp, high road, bridge, and the whole of
+ *               section 3 to the level bound. Shares its first vertex with
+ *               `grass` so the join needs no special case.
+ *   underpass – the lower route beneath the ramp, 1465 -> 1866. Entered by
+ *               DROPPING THROUGH the road (double-tap crouch); it climbs
+ *               back to meet `road` at 1866, where the two are 7px apart,
+ *               so walking right out of it rejoins the main road on foot.
  *
- * WHY THE RAMP IS THE ONE YOU JUMP TO. At the section 2 fork both routes
- * are at the same height, so physics alone decides which one a walking
- * player takes, and one-way platforms mean he can step UP onto a surface
- * but never drop through one. The lower route therefore has to be the
- * default and the upper one the deliberate choice: from the underpass the
- * ramp is 18-26px overhead, which a jump clears trivially. Swapping them
- * round — making the ramp the default and the underpass optional — is not
- * a matter of moving vertices; it would need a drop-through mechanic.
+ * WHERE THE UNDERPASS STARTS IS LOAD-BEARING. It used to begin at 1418,
+ * level with the terrace, and that made it the route a walking player took
+ * by default: groundEntity's slope-following picks the surface NEAREST the
+ * feet, and where two lines meet at the same height the one that happens
+ * to be a hair closer wins. Starting it at 1465 puts it 17px below the
+ * road at its left end — outside STEP — so a walking player stays up on
+ * the road and the only way down is a deliberate drop.
  *
  * The shrine mound above the ramp, and the hill above section 3's road,
  * have no lines at all and so are scenery you cannot reach.
@@ -647,13 +716,13 @@ const TERRAIN = {
   trench:    [[472,433],[547,454],[588,460],[719,460],[771,452],[869,427],[979,409],
               [1144,414]],
   grass:     [[1075,404],[1100,404],[1160,406],[1215,408]],
-  road:      [[1215,408],[1323,414],[1382,419],[1425,427]],
-  underpass: [[1418,427],[1564,446],[1701,447],[1767,427],[1801,403],[1838,363],
-              [1866,348]],
-  ramp:      [[1480,412],[1507,408],[1577,388],[1621,381],[1691,356],[1739,344],
+  road:      [[1215,408],[1323,414],[1382,419],[1425,427],[1452,420],[1480,412],
+              [1507,408],[1577,388],[1621,381],[1691,356],[1739,344],
               [1868,341],[1953,333],[2045,336],[2095,341],[2146,349],[2245,382],
               [2329,399],[2434,404],[2677,408],[2758,397],[2857,356],[2941,328],
-              [3031,321],[3157,287],[3235,269],[3258,267]]
+              [3031,321],[3157,287],[3235,269],[3258,267]],
+  underpass: [[1465,433],[1564,446],[1701,447],[1767,427],[1801,403],[1838,363],
+              [1866,348]]
 };
 
 /* x the road runs out at. Reaching it finishes the level — see the win
@@ -716,10 +785,12 @@ function surfacesAt(x){
  * Passing in an already-cleared flag disables slope following entirely.
  */
 const STEP = 14;
-function groundEntity(ent, oldFeetY, wasOnGround){
+function groundEntity(ent, oldFeetY, wasOnGround, minY = -Infinity){
   const feet = ent.y + ent.h;
   let best = null;
   for (const y of surfacesAt(ent.x + ent.w/2)){
+    if (y < minY) continue;                        // phasing past this one
+
     if (ent.vy >= 0 && oldFeetY <= y + 1 && feet >= y){        // fell onto it
       if (best === null || y < best) best = y;
     } else if (wasOnGround && Math.abs(y - feet) <= STEP && ent.vy >= 0){
@@ -842,13 +913,13 @@ function zombie(x, y, type = 0){
   *                escape, not on a body block                            */
  [1300,0,0],[1390,0,0],[1455,0,0],
  /* The y values here are surface hints, not positions — see zombie().
-  * Between x1480 and x1866 the ramp and the underpass are stacked, and
-  * the underpass is the route a player walks by default, so most of the
-  * opposition belongs down there. 1735 is left on the ramp so that
-  * taking the high road is not a free pass, and it can walk off the
-  * ramp's left end and drop into the underpass to join the fight.     */
- [1560,446,0],[1655,447,1],
- [1735,0,0],[1800,403,0],
+  * Between x1418 and x1866 the road and the underpass are stacked. The
+  * road is the route a player walks by default, so the fight lives up
+  * there and the underpass carries a single wolf: dropping through is a
+  * bypass that trades three enemies for the high ground, not a free
+  * corridor. The one down there can climb out at 1866 and rejoin.     */
+ [1560,0,0],[1655,0,1],
+ [1735,437,0],[1800,0,0],
  [1870,0,1],
  [1945,0,0],[2000,0,0],[2055,0,0],
  /* ---- third section: across the bridge and up to the farmhouse ------ *
@@ -1136,6 +1207,14 @@ function update(){
    * The cost is deliberate and is the trade the crouch is balanced on --
    * you cannot shoot from cover, and a tapped shot leaves you standing for
    * its 13-tick cooldown before the crouch resumes on its own.           */
+  // Double-tap crouch = drop through. Checked before the crouch state
+  // itself, so the tap that triggers the drop does not also duck him on
+  // the way down.
+  if (pressed.ArrowDown || pressed.KeyS){
+    if (t - p.lastDownTap <= DROP_TAP_WINDOW) dropThrough();
+    p.lastDownTap = t;
+  }
+
   const busy = p.whip > 0 || p.ult > 0 || p.reload > 0 || p.anim > 0 || p.cool > 0;
   // The !! matters: keys[] holds undefined for a key that has not been
   // touched yet this run, so without it p.crouch would be set to undefined
@@ -1189,7 +1268,14 @@ function update(){
    * through the floor to his death while the clamp quietly puts him back
    * on the map. The enemy loop has always had this in the right order.   */
   p.x = clamp(p.x, 0, worldW - p.w);               // level bounds
-  p.onGround = groundEntity(p, oldY + p.h, pWasOnGround);
+  if (p.dropThru > 0) p.dropThru--;
+  // While dropping through, every surface at or above the one he left is
+  // invisible to the collision, so he falls past it and lands on the next
+  // one down. Landing clears the state immediately; DROP_TICKS is only a
+  // backstop in case he drifts somewhere with nothing beneath.
+  p.onGround = groundEntity(p, oldY + p.h, pWasOnGround,
+                            p.dropThru > 0 ? p.dropFrom + 4 : -Infinity);
+  if (p.onGround) p.dropThru = 0;
   // Crouching is a grounded state, and the crouch block at the top of the
   // tick tests p.onGround from the PREVIOUS tick -- so walking off a ledge
   // would otherwise leave him drawn crouching in mid-air for one frame
@@ -1635,7 +1721,7 @@ const DEBUG_TERRAIN = false;
 /** Draw every terrain polyline, for checking the trace against the art. */
 function drawTerrainDebug(){
   const cols = { upper:"#5cf07c", trench:"#f05c5c", grass:"#f0be3c",
-                 road:"#5cc8f0", underpass:"#f07cf0", ramp:"#5cc8f0" };
+                 road:"#5cc8f0", underpass:"#f07cf0" };
   ctx.lineWidth = 2;
   for (const k in TERRAIN){
     ctx.strokeStyle = cols[k] || "#fff";
@@ -1798,7 +1884,7 @@ function draw(){
   ctx.restore();
 
   hud();
-  if (state === "title") overlay("RUINS OF DRESDEN","A 16-BIT WWII GOTHIC HORROR PROTOTYPE","ARROWS/A-D MOVE   Z/SPACE JUMP   X FIRE   C WHIP   \u25bc CROUCH   R RELOAD   U ULT","PRESS ENTER OR FIRE TO START");
+  if (state === "title") overlay("RUINS OF DRESDEN","A 16-BIT WWII GOTHIC HORROR PROTOTYPE","ARROWS/A-D MOVE   Z/SPACE JUMP   X FIRE   C WHIP   \u25bc CROUCH (\u25bc\u25bc DROP)   R RELOAD   U ULT","PRESS ENTER OR FIRE TO START");
   if (state === "dead")  overlay("YOU DIED","The dead have claimed the ruins.","","PRESS ENTER TO TRY AGAIN");
   if (state === "win")   overlay("THE ROAD ENDS","You cross the bridge out of Grunwald. The first night is over.","","PRESS ENTER TO PLAY AGAIN");
 }
@@ -1874,6 +1960,7 @@ function reset(){
   p.y = Math.min(...surfacesAt(p.x + p.w/2)) - p.h;
   p.vx = p.vy = 0;
   p.hp = p.maxhp; p.inv = p.cool = p.whip = p.ult = p.anim = p.reload = p.stride = 0;
+  p.dropThru = 0; p.lastDownTap = -999;
   p.ammo = p.magSize;
   cam = 0;
   for (const e of enemies){
